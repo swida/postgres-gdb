@@ -4,112 +4,6 @@ import subprocess
 import argparse
 from autocvar import autocvar, AutoNumCVar
 
-class TreeWalker(object):
-    """A base class for tree traverse"""
-
-    def __init__(self):
-        self.level_graph = []
-        self.autoncvar = None
-        self.current_level = 0
-
-    def reset(self):
-        self.level_graph = []
-        self.autoncvar = AutoNumCVar()
-
-    def walk(self, expr):
-        self.reset()
-        self.do_walk(expr, 0)
-
-    def do_walk(self, expr, level):
-        expr_type = expr.dynamic_type
-        expr_nodetype = None
-        try:
-            expr_nodetype = expr.type.template_argument(0)
-            if expr_nodetype.code != gdb.TYPE_CODE_PTR:
-                expr_nodetype = expr.type.template_argument(0).pointer()
-        except (gdb.error, RuntimeError):
-            expr_nodetype = None
-            pass
-
-        # There is no inheritance in C, we must do cast by calling
-        # cast_[TYPE] API.
-        cast_func = self.get_cast_func(expr_type, expr_nodetype)
-        if cast_func is not None:
-            explicit_cast_type = cast_func(expr)
-            expr_casted = expr.cast(explicit_cast_type)
-        else:
-            explicit_cast_type = None
-            expr_casted = expr.cast(expr_type)
-
-        self.current_level = level
-        level_graph = '  '.join(self.level_graph[:level])
-        for i, c in enumerate(self.level_graph):
-            if c == '`':
-                self.level_graph[i] = ' '
-        cname = self.autoncvar.set_var(expr_casted)
-        left_margin = "{}{}".format('' if level == 0 else '--', cname)
-
-        element_show_info = ''
-        show_func = None if explicit_cast_type is None else self.get_show_func(explicit_cast_type, expr_nodetype)
-        if show_func:
-            element_show_info = show_func(expr_casted)
-        else:
-            show_func = self.get_show_func(expr_type, expr_nodetype)
-            if show_func is not None:
-                element_show_info = show_func(expr if explicit_cast_type else expr_casted)
-        if element_show_info is not None:
-            expr_disp_type = explicit_cast_type if explicit_cast_type else expr_type
-            print(f"{level_graph}{left_margin} ({expr_disp_type}) {expr} {element_show_info}")
-
-        walk_func = None if explicit_cast_type is None else self.get_walk_func(explicit_cast_type, expr_nodetype)
-        if walk_func:
-            children = walk_func(expr_casted)
-        else:
-            walk_func = self.get_walk_func(expr_type, expr_nodetype)
-            if walk_func is None:
-                return
-            children = walk_func(expr if explicit_cast_type else expr_casted)
-        if not children:
-            return
-        if len(self.level_graph) < level + 1:
-            self.level_graph.append('|')
-        else:
-            self.level_graph[level] = '|'
-        for i, child in enumerate(children):
-            if i == len(children) - 1:
-                self.level_graph[level] = '`'
-            self.do_walk(child, level + 1)
-
-    def get_action_func(self, element_type, action_prefix):
-        def type_name(typ):
-            return typ.name if hasattr(typ, 'name') and typ.name is not None else str(typ)
-        func_name = action_prefix + type_name(element_type)
-        if hasattr(self, func_name):
-            return getattr(self, func_name)
-
-        for field in element_type.fields():
-            if not field.is_base_class:
-                continue
-            typ = field.type
-            func_name = action_prefix + type_name(typ)
-
-            if hasattr(self, func_name):
-                return getattr(self, func_name)
-
-            return self.get_action_func(typ, action_prefix)
-        return None
-
-    def get_walk_func(self, element_type, element_type_templ):
-        return self.get_action_func(element_type_templ.target(), 'walk_templ_') \
-            if element_type_templ is not None else self.get_action_func(element_type.target(), 'walk_')
-
-    def get_show_func(self, element_type, element_type_templ):
-        return self.get_action_func(element_type_templ.target(), 'show_templ_') \
-            if element_type_templ is not None else self.get_action_func(element_type.target(), 'show_')
-
-    def get_cast_func(self, element_type, element_type_templ):
-        return self.get_action_func(element_type_templ.target(), 'cast_templ_') \
-            if element_type_templ is not None else self.get_action_func(element_type.target(), 'cast_')
 
 gdb.Command('pg', gdb.COMMAND_DATA, prefix=True)
 
@@ -184,21 +78,174 @@ class BackendAttach(gdb.Command):
         self.attach()
 BackendAttach()
 
-class NodeTraverser(TreeWalker):
-    def walk_Node(self, val):
-        sub_nodes = []
-        if val['lefttree']:
-            sub_nodes.append(val['lefttree'])
-        if val['righttree']:
-            sub_nodes.append(val['righttree'])
-        return sub_nodes
+class TreeWalker(object):
+    """A base class for tree traverse"""
 
-    walk_Plan = walk_Node
+    SHOW_FUNC_PREFIX = 'show_'
+    WALK_FUNC_PREFIX = 'walk_'
 
-    def cast_Plan(self, val):
-        node_type = str(val['type'])
-        typ = gdb.lookup_type(node_type[2:])
-        return typ.pointer()
+    def __init__(self):
+        self.level_graph = []
+        self.autoncvar = None
+        self.current_level = 0
+
+    def reset(self):
+        self.level_graph = []
+        self.autoncvar = AutoNumCVar()
+
+    def walk(self, expr):
+        self.reset()
+        self.do_walk(expr, 0)
+
+    def do_walk(self, expr, level):
+        expr_typed = expr.dynamic_type
+        expr_casted = expr.cast(expr_typed)
+        self.current_level = level
+        level_graph = '  '.join(self.level_graph[:level])
+        for i, c in enumerate(self.level_graph):
+            if c == '`':
+                self.level_graph[i] = ' '
+        cname = self.autoncvar.set_var(expr_casted)
+        left_margin = "{}{}".format('' if level == 0 else '--', cname)
+        element_show_info = ''
+        show_func = self.get_action_func(expr_typed, self.SHOW_FUNC_PREFIX)
+        if show_func is not None:
+            element_show_info = show_func(expr_casted)
+        if element_show_info is not None:
+            print("{}{} ({}) {} {}".format(
+                  level_graph, left_margin, expr_typed, expr, element_show_info))
+        walk_func = self.get_action_func(expr_typed, self.WALK_FUNC_PREFIX)
+        if walk_func is None:
+            return
+        children = walk_func(expr_casted)
+        if not children:
+            return
+        if len(self.level_graph) < level + 1:
+            self.level_graph.append('|')
+        else:
+            self.level_graph[level] = '|'
+        for i, child in enumerate(children):
+            if i == len(children) - 1:
+                self.level_graph[level] = '`'
+            self.do_walk(child, level + 1)
+
+    def get_action_func(self, element_type, action_prefix):
+        def type_name(typ):
+            if typ.code == gdb.TYPE_CODE_PTR:
+                typ = typ.target()
+            return typ.name if hasattr(typ, 'name') and typ.name is not None else str(typ)
+        func_name = action_prefix + type_name(element_type)
+        if hasattr(self, func_name) and callable(getattr(self, func_name)):
+            return getattr(self, func_name)
+
+        for field in element_type.fields():
+            if not field.is_base_class:
+                continue
+            typ = field.type
+            func_name = action_prefix + type_name(typ)
+
+            if hasattr(self, func_name):
+                return getattr(self, func_name)
+
+            return self.get_action_func(typ, action_prefix)
+
+        # Fall through to common action function
+        if hasattr(self, action_prefix) and callable(getattr(self, action_prefix)):
+            return getattr(self, action_prefix)
+
+        return None
+
+def cast_Node(val):
+    node_type = str(val['type'])
+    typ = gdb.lookup_type(node_type[2:])
+    return val.cast(typ.pointer())
+
+class ListCell:
+    ptr = 1
+    Int = 451
+    Oid = 452
+    Xid = 453
+    type_values = {ptr : 'ptr_value', Int : 'int_value',
+                   Oid : 'oid_value', Xid : 'xid_value'}
+    def __init__(self, typ, val, val_type):
+        self.value_type = typ
+        self.value = val[self.type_values[typ]]
+        if typ != self.ptr:
+            return
+        self.value = cast_Node(self.value.cast(val_type.pointer())) if \
+            val_type.name == 'Node' else self.value.cast(val_type.pointer())
+    def to_string(self, cvar):
+        if self.value_type != self.ptr:
+            return self.value
+        type_name = self.value.dereference().type.name
+        return f'{cvar} ({type_name} *) '  + str(self.value)
+
+class List:
+    def  __init__(self, val, ptr_type_name = None):
+        self._type = int(val['type'])
+        self.type_name = ListCell.type_values[self._type]
+        self.length = int(val["length"])
+        self._elements = val["elements"]
+        self._index = 0
+        self._ptr_type = gdb.lookup_type(ptr_type_name) if ptr_type_name else None
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._index >= self.length:
+            raise StopIteration
+        cell = ListCell(self._type, self._elements[self._index], self._ptr_type)
+        self._index += 1
+        return cell
+
+class ExprTraverser(gdb.Command, TreeWalker):
+    def __init__ (self):
+        super(self.__class__, self).__init__ ("pg expr", gdb.COMMAND_DATA)
+
+    def walk_List(self, val):
+        children = []
+        for ele in List(val, "Node"):
+            children.append(ele.value)
+        return children
+    def _walk_to_args(self, val):
+        return self.walk_List(val['args']) if gdb.types.has_field(val.type.target(), 'args') else []
+    def walk_(self, val):
+        return self._walk_to_args(val)
+
+    def show_Const(self, val):
+        return 'isnull=true' if val['constisnull'] else f'type={val["consttype"]}, value={val["constvalue"]}'
+    def show_Var(self, val):
+        return f'no={val["varno"]}, attno={val["varattno"]}, type={val["vartype"]}'
+    def show_BoolExpr(self, val):
+        return f'op={val["boolop"]}'
+    def show_OpExpr(self, val):
+        return f'no={val["opno"]}'
+    show_ScalarArrayOpExpr = show_OpExpr
+    def show_FuncExpr(self, val):
+        return f'id={val["funcid"]}, resulttype={val["funcresulttype"]}'
+
+    def invoke(self, arg, from_tty):
+        if not arg:
+            print("usage: pg expr [expr]")
+            return
+        expr = gdb.parse_and_eval(arg)
+        self.walk(expr)
+ExprTraverser()
+
+class PlanTraverser(gdb.Command, TreeWalker):
+    def __init__ (self):
+        super(self.__class__, self).__init__ ("pg plan", gdb.COMMAND_DATA)
+
+    def walk_(self, val):
+        children = []
+        typ = gdb.lookup_type('Plan')
+        plan = val.cast(typ.pointer())
+        for field in ('lefttree', 'righttree'):
+            if plan[field]:
+                child = plan[field]
+                children.append(cast_Node(child))
+        return children
 
     def show_scan(self, val):
         relid = val['scan']['scanrelid']
@@ -206,72 +253,31 @@ class NodeTraverser(TreeWalker):
 
     show_SeqScan = show_scan
 
-class PlanTraverser(gdb.Command, NodeTraverser):
-    def __init__ (self):
-        super(self.__class__, self).__init__ ("pg plan", gdb.COMMAND_DATA)
-
     def invoke(self, arg, from_tty):
         if not arg:
             print("usage: pg plan [plan]")
             return
         plan = gdb.parse_and_eval(arg)
-        self.walk(plan)
+        self.walk(cast_Node(plan))
 PlanTraverser()
-
-class NodeCast:
-    def __init__(self, val):
-        self._val = val
-        node_type = gdb.lookup_type('Node')
-        self.explicit_type_name = str(self._val.cast(node_type.pointer())['type'])[2:]
-        explicit_type = gdb.lookup_type(self.explicit_type_name)
-        self.explicit_val = self._val.cast(explicit_type.pointer())
-
-    def to_string(self, autoncvar):
-        cvar = autoncvar.set_var(self.explicit_val)
-        return f'{cvar} ({self.explicit_type_name} *)' + str(self.explicit_val)
-
-class ListCell:
-    """Print a ListCell object."""
-    ptr = 1
-    Int = 451
-    Oid = 452
-    Xid = 453
-    def __init__(self, typ, val):
-        self._typ = typ
-        self._val = val
-
-    def to_string(self, autoncvar):
-        typvalues = {ListCell.ptr : 'ptr_value', ListCell.Int : 'int_value',
-                     ListCell.Oid : 'oid_value', ListCell.Xid : 'xid_value'}
-        val = self._val[typvalues[self._typ]]
-        return NodeCast(val).to_string(autoncvar) if self._typ == ListCell.ptr else val
 
 class ListPrinter:
     """Pretty-printer for List."""
     def __init__(self, val):
-        self._val = val
-        self._typ = int(self._val['type'])
+        self.val = List(val, "Node")
         self.autoncvar = AutoNumCVar()
 
     def display_hint(self):
         return "array"
 
     def to_string(self):
-        typnames = {ListCell.ptr : 'ptr', ListCell.Int : 'Int',
-                    ListCell.Oid : 'Oid', ListCell.Xid : 'Xid'}
-        length = int(self._val['length'])
-        return f"List with {length} {typnames[self._typ]} elements"
+        return f"List with {self.val.length} {self.val.type_name} elements"
 
     def children(self):
-        length = int(self._val["length"])
-        elements = self._val["elements"]
+        for i, elt in enumerate(self.val):
+            cvar = autocvar.set_var(elt.value)
+            yield (str(i), elt.to_string(cvar))
 
-        child_i = 0
-        for elt in range(length):
-            cell = elements[elt]
-            listcell = ListCell(self._typ, cell)
-            yield (str(child_i), listcell.to_string(self.autoncvar))
-            child_i += 1
 def register_pretty_printer(objfile):
     """A routine to register a pretty-printer against the given OBJFILE."""
     objfile.pretty_printers.append(type_lookup_function)
