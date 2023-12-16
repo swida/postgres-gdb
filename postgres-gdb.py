@@ -156,6 +156,8 @@ class TreeWalker(object):
         return None
 
 def cast_Node(val):
+    if val.type.target().code == gdb.TYPE_CODE_VOID:
+        val = val.cast(gdb.lookup_type("Node").pointer())
     node_type = str(val['type'])
     typ = gdb.lookup_type(node_type[2:])
     return val.cast(typ.pointer())
@@ -172,7 +174,7 @@ class ListCell:
         self.value = val[self.type_values[typ]]
         if typ != self.ptr:
             return
-        self.value = cast_Node(self.value.cast(val_type.pointer())) if \
+        self.value = cast_Node(self.value) if \
             val_type.name == 'Node' else self.value.cast(val_type.pointer())
     def to_string(self, cvar):
         if self.value_type != self.ptr:
@@ -212,18 +214,32 @@ class ExprTraverser(gdb.Command, TreeWalker):
         return self.walk_List(val['args']) if gdb.types.has_field(val.type.target(), 'args') else []
     def walk_(self, val):
         return self._walk_to_args(val)
-
-    def show_Const(self, val):
-        return 'isnull=true' if val['constisnull'] else f'type={val["consttype"]}, value={val["constvalue"]}'
-    def show_Var(self, val):
-        return f'no={val["varno"]}, attno={val["varattno"]}, type={val["vartype"]}'
-    def show_BoolExpr(self, val):
-        return f'op={val["boolop"]}'
-    def show_OpExpr(self, val):
-        return f'no={val["opno"]}'
-    show_ScalarArrayOpExpr = show_OpExpr
-    def show_FuncExpr(self, val):
-        return f'id={val["funcid"]}, resulttype={val["funcresulttype"]}'
+    def show_(self, val):
+        # Display properties for each struct, can define as single string if
+        # only 1 property needs to display. if a property name includes ':',
+        # a property value can be appended after ':'. It will be hided if
+        # the property value does not equal to the value.
+        display_fields = {
+            'Const' : ('constisnull:true', 'consttype', 'constvalue'),
+            'Var' : ('varno', 'varattno', 'vartype'),
+            'BoolExpr' : 'boolop',
+            'OpExpr' : 'opno',
+            'ScalarArrayOpExpr' : 'opno',
+            'FuncExpr' : ('funcid', 'funcresulttype')
+            }
+        typname = val.dereference().type.name
+        def prop_str(prop):
+            if ':' in prop:
+                prop, disp_val = prop.split(':')
+                if disp_val != str(val[prop]):
+                    return ''
+            name = prop[len(typname):] if prop.startswith(typname.lower()) else prop
+            return f'{name} = {val[prop]}'
+        if typname not in display_fields:
+            return ''
+        prop = display_fields[typname]
+        return prop_str(prop) if isinstance(prop, str) else \
+            ', '.join([prop_str(p) for p in prop if prop_str(p)])
 
     def invoke(self, arg, from_tty):
         if not arg:
@@ -260,6 +276,19 @@ class PlanTraverser(gdb.Command, TreeWalker):
         plan = gdb.parse_and_eval(arg)
         self.walk(cast_Node(plan))
 PlanTraverser()
+
+class NodeCastPrinter(gdb.Command):
+    def __init__ (self):
+        super(self.__class__, self).__init__ ("pg node", gdb.COMMAND_DATA)
+    def invoke(self, arg, from_tty):
+        if not arg:
+            print("usage: pg plan [plan]")
+            return
+        node = gdb.parse_and_eval(arg)
+        val = cast_Node(node)
+        cname = AutoNumCVar().set_var(val)
+        print(f'{cname} ({val.type})', val)
+NodeCastPrinter()
 
 class ListPrinter:
     """Pretty-printer for List."""
